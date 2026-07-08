@@ -48,6 +48,7 @@ Use the built-in continuous integration in GitLab.
 
 - Mahalakshmi Jayaraman
 - Sandeep
+- Dinely
 
 ---
 
@@ -127,24 +128,6 @@ ghibli_lora_project/
 - Successfully tested the training script for 20 steps.
 - Started full training for 800 steps.
 - Fixed the FP16 gradient issue by keeping trainable LoRA parameters in float32.
-
----
-
-## Work Division
-
-| Task | Person Responsible | Description |
-|---|---|---|
-| Dataset organization | Mahalakshmi | Organize the dataset into `style_imgs/original/` and `style_imgs/512/`. |
-| Environment setup | Mahalakshmi | Create virtual environment and install required libraries. |
-| CUDA/GPU setup | Mahalakshmi | Update NVIDIA driver and verify CUDA availability. |
-| Training script | Mahalakshmi | Implement `code/train_lora.py` with tokenizer update, UNet LoRA, and text encoder LoRA. |
-| LoRA training | Mahalakshmi | Run 20-step test training and full 800-step training. |
-| Training debugging | Mahalakshmi | Fix CUDA, dependency, and FP16 gradient issues. |
-| Evaluation script | Sandeep | Implement `code/eval_lora.py` to load the trained LoRA adapter and generate images. |
-| Sample generation | Sandeep | Generate at least 3 output images and save them inside `samples/`. |
-| README documentation | Both | Document project overview, setup commands, training command, evaluation command, and work division. |
-| Final report | Both | Prepare the final report with method, hyperparameters, results, and limitations. |
-| Final submission check | Both | Verify all required files are included in the final ZIP/tar.gz file. |
 
 ---
 
