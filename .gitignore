@@ -1,0 +1,6 @@
+ghibli_lora_env/
+__pycache__/
+*.pyc
+.cache/
+.DS_Store
+.vscode/
