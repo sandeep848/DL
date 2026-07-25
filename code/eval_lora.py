@@ -1,6 +1,30 @@
 import os
+import sys
+import builtins
+
+# Override built-in print to force flushing and gracefully handle Windows console unicode encoding errors
+def print(*args, **kwargs):
+    kwargs.setdefault('flush', True)
+    encoding = getattr(sys.stdout, 'encoding', 'utf-8') or 'utf-8'
+    clean_args = []
+    for arg in args:
+        if isinstance(arg, str):
+            clean_args.append(arg.encode(encoding, errors='replace').decode(encoding))
+        else:
+            clean_args.append(arg)
+    builtins.print(*clean_args, **kwargs)
+
+# Suppress TensorFlow logging to clean up execution output and speed up imports
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+# Disable oneDNN custom operations warnings from TensorFlow
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
+print("🎨 Ghibli Market LoRA: Starting evaluation script...", flush=True)
+
 import argparse
 import torch
+
+print("Importing Stable Diffusion evaluation libraries (this can take up to a minute on CPU)...", flush=True)
 from safetensors.torch import load_file
 from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
 

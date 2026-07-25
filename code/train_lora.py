@@ -1,4 +1,26 @@
 import os
+import sys
+import builtins
+
+# Override built-in print to force flushing and gracefully handle Windows console unicode encoding errors
+def print(*args, **kwargs):
+    kwargs.setdefault('flush', True)
+    encoding = getattr(sys.stdout, 'encoding', 'utf-8') or 'utf-8'
+    clean_args = []
+    for arg in args:
+        if isinstance(arg, str):
+            clean_args.append(arg.encode(encoding, errors='replace').decode(encoding))
+        else:
+            clean_args.append(arg)
+    builtins.print(*clean_args, **kwargs)
+
+# Suppress TensorFlow logging to clean up execution output and speed up imports
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+# Disable oneDNN custom operations warnings from TensorFlow
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
+print("🎨 Ghibli Market LoRA: Starting initialization...")
+
 import argparse
 import random
 import numpy as np
@@ -8,6 +30,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from safetensors.torch import save_file
 
+print("Importing Stable Diffusion & PEFT libraries (this can take up to a minute on CPU)...", flush=True)
 # Import Stable Diffusion and PEFT components
 from transformers import CLIPTokenizer, CLIPTextModel
 from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler, StableDiffusionPipeline
@@ -16,6 +39,7 @@ from peft.utils import get_peft_model_state_dict
 
 # Custom Dataset
 from dataset import GhibliDataset
+
 
 def set_seed(seed):
     """Set random seed for reproducibility."""
@@ -100,8 +124,8 @@ def parse_args():
     parser.add_argument(
         "--validation_steps", 
         type=int, 
-        default=200, 
-        help="Generate validation images every X steps"
+        default=None, 
+        help="Generate validation images every X steps (defaults to 0 on CPU, 200 on GPU)"
     )
     
     # Toggles
@@ -115,16 +139,23 @@ def parse_args():
         action="store_true", 
         help="Disable data augmentations during dataset loading"
     )
+    parser.add_argument(
+        "--cache_latents", 
+        action="store_true", 
+        help="Pre-encode dataset images to latents and cache them in RAM to speed up training"
+    )
 
     return parser.parse_args()
 
 def clean_peft_state_dict(peft_state_dict, prefix):
-    """Strip base_model prefixes from PEFT state dict and add target prefix (unet or text_encoder)"""
+    """Strip base_model prefixes and adapter names from PEFT state dict and add target prefix (unet or text_encoder)"""
     clean_dict = {}
     for k, v in peft_state_dict.items():
         key = k
         if key.startswith("base_model.model."):
             key = key[len("base_model.model."):]
+        # Strip PEFT adapter name suffix (e.g. '.default') to ensure compatibility with standard Diffusers loaders
+        key = key.replace(".default.", ".")
         clean_dict[f"{prefix}.{key}"] = v
     return clean_dict
 
@@ -142,7 +173,20 @@ def main():
     # 2. Setup environment and device
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training on device: {device}")
+    print(f"Training on device: {device}", flush=True)
+    
+    # Configure dynamic defaults for validation steps based on CPU/GPU
+    if args.validation_steps is None:
+        args.validation_steps = 0 if device.type == "cpu" else 200
+        
+    if args.validation_steps > 0:
+        print(f"Validation images will be generated every {args.validation_steps} steps.", flush=True)
+    else:
+        print("Intermediate validation image generation is disabled.", flush=True)
+        
+    if args.cache_latents and not args.no_augmentation:
+        print("Notice: Caching latents requires disabling data augmentation. Disabling data augmentation...", flush=True)
+        args.no_augmentation = True
     
     # 3. Load pretrained models
     print(f"Loading pretrained models from: {args.model_name}")
@@ -238,6 +282,10 @@ def main():
         use_augmentation=not args.no_augmentation
     )
     
+    if args.cache_latents:
+        print("Caching VAE latents in memory to optimize training performance...", flush=True)
+        dataset.cache_latents_with_vae(vae, device, weight_dtype)
+        
     train_dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -267,14 +315,18 @@ def main():
                 break
                 
             # Process batch
-            pixel_values = batch["pixel_values"].to(device, dtype=weight_dtype)
             input_ids = batch["input_ids"].to(device)
             
             # Forward pass inside context manager for mixed precision
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                # Encode images to latent space
-                scaling_factor = getattr(vae.config, "scaling_factor", 0.18215)
-                latents = vae.encode(pixel_values).latent_dist.sample() * scaling_factor
+                if "latents" in batch:
+                    # Use pre-cached VAE latents (CPU/GPU-agnostic)
+                    latents = batch["latents"].to(device, dtype=weight_dtype)
+                else:
+                    # Run VAE encoder on-the-fly (e.g. if data augmentation is on)
+                    pixel_values = batch["pixel_values"].to(device, dtype=weight_dtype)
+                    scaling_factor = getattr(vae.config, "scaling_factor", 0.18215)
+                    latents = vae.encode(pixel_values).latent_dist.sample() * scaling_factor
                 
                 # Sample noise
                 noise = torch.randn_like(latents)
@@ -326,11 +378,11 @@ def main():
                 progress_bar.set_postfix({"loss": loss.item() * args.gradient_accumulation_steps})
                 
                 # 10. Intermediate Validation Generation
-                if global_step % args.validation_steps == 0:
+                if args.validation_steps > 0 and global_step % args.validation_steps == 0:
                     unet.eval()
                     text_encoder.eval()
                     validation_prompt = f"a busy market, in {args.instance_token} style"
-                    print(f"\n[Step {global_step}] Generating validation image...")
+                    print(f"\n[Step {global_step}] Generating validation image...", flush=True)
                     
                     try:
                         # Construct a temporary pipeline reusing active components to save system RAM and VRAM
@@ -342,7 +394,8 @@ def main():
                             scheduler=noise_scheduler,
                             safety_checker=None,
                             feature_extractor=None,
-                            requires_safety_checker=False
+                            requires_safety_checker=False,
+                            torch_dtype=weight_dtype
                         )
                         
                         # Generate image

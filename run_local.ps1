@@ -9,16 +9,17 @@ Write-Host "==============================================" -ForegroundColor Gre
 
 # Step 1: Run Training
 Write-Host "`n[Step 1/2] Starting LoRA Training on CPU..." -ForegroundColor Cyan
-Write-Host "Note: Training 800 steps on CPU is slow and can take around 2-3 hours." -ForegroundColor Yellow
-Write-Host "Command: python code/train_lora.py --data_dir style_imgs/512 --instance_token '<sks>' --output_dir lora_out --rank 8 --max_steps 800 --overwrite" -ForegroundColor Gray
+Write-Host "Note: Training configured for 20 steps for rapid validation." -ForegroundColor Yellow
+Write-Host "Command: python code/train_lora.py --data_dir style_imgs/512 --instance_token '<sks>' --output_dir lora_out --rank 8 --max_steps 20 --overwrite --no_augmentation" -ForegroundColor Gray
 
 & $PythonPath code/train_lora.py `
   --data_dir style_imgs/512 `
   --instance_token "<sks>" `
   --output_dir lora_out `
   --rank 8 `
-  --max_steps 800 `
-  --overwrite
+  --max_steps 20 `
+  --overwrite `
+  --no_augmentation
 
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Training failed! Exiting."

@@ -56,16 +56,45 @@ class GhibliDataset(Dataset):
             max_length=self.tokenizer.model_max_length,
             return_tensors="pt"
         ).input_ids[0]
+        
+        self.cached_latents = None
 
     def __len__(self):
         return len(self.image_paths)
 
+    def cache_latents_with_vae(self, vae, device, weight_dtype):
+        """Pre-encode all images in the dataset to latents using VAE and cache them in CPU RAM."""
+        from tqdm import tqdm
+        self.cached_latents = []
+        vae.eval()
+        with torch.no_grad():
+            for idx in tqdm(range(len(self.image_paths)), desc="Caching VAE latents"):
+                img_path = self.image_paths[idx]
+                try:
+                    image = Image.open(img_path).convert("RGB")
+                except Exception as e:
+                    print(f"Error reading image {img_path}: {e}. Retrying first image.", flush=True)
+                    image = Image.open(self.image_paths[0]).convert("RGB")
+                
+                pixel_values = self.transform(image).unsqueeze(0).to(device, dtype=weight_dtype)
+                scaling_factor = getattr(vae.config, "scaling_factor", 0.18215)
+                # Encode to latent space and sample representation
+                latents = vae.encode(pixel_values).latent_dist.sample() * scaling_factor
+                # Store on CPU to conserve RAM/VRAM
+                self.cached_latents.append(latents.squeeze(0).cpu())
+
     def __getitem__(self, idx):
+        if self.cached_latents is not None:
+            return {
+                "latents": self.cached_latents[idx],
+                "input_ids": self.input_ids
+            }
+            
         img_path = self.image_paths[idx]
         try:
             image = Image.open(img_path).convert("RGB")
         except Exception as e:
-            print(f"Error reading image {img_path}: {e}. Retrying first image.")
+            print(f"Error reading image {img_path}: {e}. Retrying first image.", flush=True)
             image = Image.open(self.image_paths[0]).convert("RGB")
             
         pixel_values = self.transform(image)
