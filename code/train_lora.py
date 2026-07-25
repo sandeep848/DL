@@ -32,7 +32,7 @@ from safetensors.torch import save_file
 
 print("Importing Stable Diffusion & PEFT libraries (this can take up to a minute on CPU)...", flush=True)
 # Import Stable Diffusion and PEFT components
-from transformers import CLIPTokenizer, CLIPTextModel
+from transformers import CLIPTokenizer, CLIPTextModel, get_cosine_schedule_with_warmup
 from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler, StableDiffusionPipeline
 from peft import LoraConfig, get_peft_model
 from peft.utils import get_peft_model_state_dict
@@ -88,14 +88,44 @@ def parse_args():
     parser.add_argument(
         "--rank", 
         type=int, 
-        default=8, 
-        help="LoRA rank dimension"
+        default=32, 
+        help="LoRA rank dimension (default: 32)"
+    )
+    parser.add_argument(
+        "--noise_offset", 
+        type=float, 
+        default=0.08, 
+        help="Noise offset to apply to initial noise for richer color contrast (default: 0.08)"
+    )
+    parser.add_argument(
+        "--initializer_token", 
+        type=str, 
+        default="anime", 
+        help="Vocabulary token word used to initialize the style token embedding (default: 'anime')"
     )
     parser.add_argument(
         "--learning_rate", 
         type=float, 
         default=1e-4, 
-        help="Learning rate for LoRA weights and token embedding"
+        help="Learning rate for LoRA weights"
+    )
+    parser.add_argument(
+        "--embedding_lr", 
+        type=float, 
+        default=5e-4, 
+        help="Learning rate for the custom style token embedding (default: 5e-4)"
+    )
+    parser.add_argument(
+        "--snr_gamma", 
+        type=float, 
+        default=5.0, 
+        help="Min-SNR loss weighting gamma value (default: 5.0)"
+    )
+    parser.add_argument(
+        "--warmup_steps", 
+        type=int, 
+        default=200, 
+        help="Warmup steps for Cosine LR scheduler (default: 200)"
     )
     parser.add_argument(
         "--batch_size", 
@@ -106,8 +136,8 @@ def parse_args():
     parser.add_argument(
         "--max_steps", 
         type=int, 
-        default=800, 
-        help="Maximum training steps"
+        default=1500, 
+        help="Maximum training steps (default: 1500)"
     )
     parser.add_argument(
         "--gradient_accumulation_steps", 
@@ -201,17 +231,23 @@ def main():
     print(f"Added token: {args.instance_token} to tokenizer. Number of added tokens: {num_added_tokens}")
     text_encoder.resize_token_embeddings(len(tokenizer))
     
-    # Initialize the new token embedding with the 'style' token representation
+    # Initialize the new token embedding with the initializer token representation (default: 'anime')
     token_id = tokenizer.convert_tokens_to_ids(args.instance_token)
-    style_token_ids = tokenizer.encode("style", add_special_tokens=False)
+    anchor_token = args.initializer_token
+    style_token_ids = tokenizer.encode(anchor_token, add_special_tokens=False)
+    if len(style_token_ids) == 0 and anchor_token != "style":
+        # Fallback to 'style' if anchor_token is not found
+        anchor_token = "style"
+        style_token_ids = tokenizer.encode(anchor_token, add_special_tokens=False)
+        
     if len(style_token_ids) > 0:
         style_token_id = style_token_ids[0]
-        print(f"Initializing embedding of '{args.instance_token}' (ID {token_id}) with weights of 'style' (ID {style_token_id})")
+        print(f"Initializing embedding of '{args.instance_token}' (ID {token_id}) with weights of '{anchor_token}' (ID {style_token_id})")
         with torch.no_grad():
             token_embeds = text_encoder.get_input_embeddings().weight.data
             token_embeds[token_id] = token_embeds[style_token_id].clone()
     else:
-        print("Warning: Could not find 'style' token in vocabulary for initialization.")
+        print(f"Warning: Could not find '{anchor_token}' token in vocabulary for initialization.")
         
     # 5. Freeze base weights
     vae.requires_grad_(False)
@@ -247,13 +283,12 @@ def main():
     unet.to(device)
     text_encoder.to(device)
     
-    # Fallback to fp32 on CPU, AMP fp16 on GPU
+    # Fallback to fp32 on CPU, AMP fp16 on GPU for VAE / latents
     weight_dtype = torch.float32
     if device.type == "cuda":
         weight_dtype = torch.float16
         vae.to(dtype=weight_dtype)
-        unet.to(dtype=weight_dtype)
-        text_encoder.to(dtype=weight_dtype)
+        # Note: unet and text_encoder trainable weights stay in float32 for GradScaler / AMP compatibility
         
     # 8. Setup optimizer and dataset
     # We optimize the LoRA weights of UNet and Text Encoder, AND the custom embedding token
@@ -270,9 +305,14 @@ def main():
     params_to_optimize = [
         {"params": unet_params, "lr": args.learning_rate},
         {"params": text_encoder_params, "lr": args.learning_rate},
-        {"params": [embedding_param], "lr": args.learning_rate, "weight_decay": 0.0}
+        {"params": [embedding_param], "lr": args.embedding_lr, "weight_decay": 0.0}
     ]
     optimizer = torch.optim.AdamW(params_to_optimize, weight_decay=1e-2)
+    lr_scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=args.max_steps
+    )
     
     dataset = GhibliDataset(
         data_dir=args.data_dir,
@@ -301,7 +341,7 @@ def main():
     progress_bar = tqdm(total=args.max_steps, desc="Training")
     
     # Setup mixed-precision Scaler if on GPU
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    scaler = torch.amp.GradScaler('cuda', enabled=(device.type == "cuda"))
     
     unet.train()
     text_encoder.train()
@@ -318,7 +358,7 @@ def main():
             input_ids = batch["input_ids"].to(device)
             
             # Forward pass inside context manager for mixed precision
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            with torch.amp.autocast('cuda', enabled=(device.type == "cuda")):
                 if "latents" in batch:
                     # Use pre-cached VAE latents (CPU/GPU-agnostic)
                     latents = batch["latents"].to(device, dtype=weight_dtype)
@@ -328,8 +368,12 @@ def main():
                     scaling_factor = getattr(vae.config, "scaling_factor", 0.18215)
                     latents = vae.encode(pixel_values).latent_dist.sample() * scaling_factor
                 
-                # Sample noise
+                # Sample noise with optional offset noise to improve dynamic range and color contrast
                 noise = torch.randn_like(latents)
+                if args.noise_offset > 0:
+                    noise += args.noise_offset * torch.randn(
+                        (latents.shape[0], latents.shape[1], 1, 1), device=latents.device, dtype=latents.dtype
+                    )
                 
                 # Sample random timesteps
                 timesteps = torch.randint(
@@ -348,8 +392,18 @@ def main():
                 # Predict noise residuals
                 noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
                 
-                # Calculate MSE Loss
-                loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                # Calculate Loss with optional Min-SNR Gamma weighting
+                if args.snr_gamma > 0:
+                    alphas_cumprod = noise_scheduler.alphas_cumprod.to(device)
+                    alpha_prod_t = alphas_cumprod[timesteps]
+                    snr = alpha_prod_t / (1 - alpha_prod_t)
+                    gamma = torch.full_like(snr, args.snr_gamma)
+                    snr_weight = torch.stack([snr, gamma], dim=-1).min(dim=-1)[0] / snr
+                    loss_unweighted = F.mse_loss(noise_pred.float(), noise.float(), reduction="none")
+                    loss = (loss_unweighted.mean(dim=list(range(1, len(loss_unweighted.shape)))) * snr_weight).mean()
+                else:
+                    loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                    
                 loss = loss / args.gradient_accumulation_steps
                 
             # Backward pass
@@ -367,10 +421,12 @@ def main():
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 # Gradient clipping
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(params_to_optimize[0]["params"] + params_to_optimize[1]["params"], 1.0)
+                all_trainable_params = [p for group in params_to_optimize for p in group["params"]]
+                torch.nn.utils.clip_grad_norm_(all_trainable_params, 1.0)
                 
                 scaler.step(optimizer)
                 scaler.update()
+                lr_scheduler.step()
                 optimizer.zero_grad()
                 
                 global_step += 1
@@ -394,8 +450,7 @@ def main():
                             scheduler=noise_scheduler,
                             safety_checker=None,
                             feature_extractor=None,
-                            requires_safety_checker=False,
-                            torch_dtype=weight_dtype
+                            requires_safety_checker=False
                         )
                         
                         # Generate image

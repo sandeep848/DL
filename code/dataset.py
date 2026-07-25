@@ -45,17 +45,27 @@ class GhibliDataset(Dataset):
         
         self.transform = transforms.Compose(transform_list)
         
-        # Define prompt template for style learning
-        self.prompt = f"a painting in {self.instance_token} style"
+        # Define diverse Studio Ghibli 2D anime prompt templates for style learning
+        self.prompt_templates = [
+            f"a Studio Ghibli 2D anime style painting, in {self.instance_token} style",
+            f"a hand-drawn 2D anime animation scene with vibrant background, in {self.instance_token} style",
+            f"a detailed Studio Ghibli artwork featuring lush scenery, in {self.instance_token} style",
+            f"a classic 2D Ghibli anime scene with rich colors, in {self.instance_token} style",
+            f"a masterwork 2D animation painting, in {self.instance_token} style",
+            f"a detailed Studio Ghibli character portrait, beautiful clear face, 2D anime, in {self.instance_token} style"
+        ]
         
-        # Pre-tokenize the caption
-        self.input_ids = self.tokenizer(
-            self.prompt,
-            padding="max_length",
-            truncation=True,
-            max_length=self.tokenizer.model_max_length,
-            return_tensors="pt"
-        ).input_ids[0]
+        # Pre-tokenize all prompt templates
+        self.tokenized_prompts = [
+            self.tokenizer(
+                p,
+                padding="max_length",
+                truncation=True,
+                max_length=self.tokenizer.model_max_length,
+                return_tensors="pt"
+            ).input_ids[0]
+            for p in self.prompt_templates
+        ]
         
         self.cached_latents = None
 
@@ -84,10 +94,11 @@ class GhibliDataset(Dataset):
                 self.cached_latents.append(latents.squeeze(0).cpu())
 
     def __getitem__(self, idx):
+        input_ids = self.tokenized_prompts[idx % len(self.tokenized_prompts)]
         if self.cached_latents is not None:
             return {
                 "latents": self.cached_latents[idx],
-                "input_ids": self.input_ids
+                "input_ids": input_ids
             }
             
         img_path = self.image_paths[idx]
@@ -101,5 +112,5 @@ class GhibliDataset(Dataset):
         
         return {
             "pixel_values": pixel_values,
-            "input_ids": self.input_ids
+            "input_ids": input_ids
         }

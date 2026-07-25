@@ -82,6 +82,18 @@ def parse_args():
         default=123, 
         help="Seed for generation reproducibility"
     )
+    parser.add_argument(
+        "--instance_token", 
+        type=str, 
+        default=None, 
+        help="Optional custom style token identifier (e.g. <sks>). Auto-detected from prompt if omitted."
+    )
+    parser.add_argument(
+        "--negative_prompt", 
+        type=str, 
+        default="deformed eyes, poorly drawn face, disfigured, bad anatomy, photorealistic, 3d render, realistic photo, CGI, photograph, real life, 3d digital art, bad face, extra limbs, low resolution, ugly, blurry, noisy", 
+        help="Negative prompt to prevent photorealistic bleeding and distorted facial features"
+    )
     
     return parser.parse_args()
 
@@ -111,18 +123,18 @@ def main():
     # Use DPM-Solver Multistep Scheduler for high-quality, fast generation
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
     
-    # 2. Identify the instance token from the prompt (e.g. "<sks>")
-    # We search the prompt for common bracket-style custom tokens
-    instance_token = None
-    if "<sks>" in args.prompt:
-        instance_token = "<sks>"
-    else:
-        # Fallback to search for any bracket token in prompt
-        import re
-        tokens = re.findall(r"<[^>]+>", args.prompt)
-        if tokens:
-            instance_token = tokens[0]
-            print(f"Detected custom token in prompt: {instance_token}")
+    # 2. Identify the instance token from args or prompt (e.g. "<sks>")
+    instance_token = args.instance_token
+    if instance_token is None:
+        if "<sks>" in args.prompt:
+            instance_token = "<sks>"
+        else:
+            # Fallback to search for any bracket token in prompt
+            import re
+            tokens = re.findall(r"<[^>]+>", args.prompt)
+            if tokens:
+                instance_token = tokens[0]
+                print(f"Detected custom token in prompt: {instance_token}")
             
     if instance_token is None:
         print("Warning: No custom bracket token (like <sks>) detected in prompt.")
@@ -139,18 +151,19 @@ def main():
         pipe.text_encoder.resize_token_embeddings(len(pipe.tokenizer))
         token_id = pipe.tokenizer.convert_tokens_to_ids(instance_token)
         
-        if "text_encoder_embeddings" in state_dict:
-            trained_embedding = state_dict.pop("text_encoder_embeddings")
+    # Load remaining LoRA weights (UNet and text encoder)
+    # Always pop text_encoder_embeddings if it exists so load_lora_weights doesn't crash on keys without 'lora' substring
+    if "text_encoder_embeddings" in state_dict:
+        trained_embedding = state_dict.pop("text_encoder_embeddings")
+        if instance_token is not None:
             print(f"Loading trained embedding of shape {trained_embedding.shape} for token {instance_token} (ID {token_id})")
             with torch.no_grad():
                 pipe.text_encoder.get_input_embeddings().weight.data[token_id] = trained_embedding.to(
                     device=pipe.text_encoder.get_input_embeddings().weight.device, dtype=weight_dtype
                 )
         else:
-            print("Warning: 'text_encoder_embeddings' key not found in weights file.")
-            print("The custom token will use default resized embedding weights.")
+            print("Warning: Custom token embedding found in weights but no token provided in prompt to attach it to.")
             
-    # Load remaining LoRA weights (UNet and text encoder)
     pipe.load_lora_weights(state_dict)
     
     # Setup execution accelerators
@@ -161,8 +174,11 @@ def main():
         pipe.enable_vae_slicing()
         
     # 4. Generate Images
-    print(f"Generating {args.num_images} images for prompt: '{args.prompt}'")
-    
+    augmented_prompt = args.prompt + ", masterpiece, high quality, highly detailed, beautiful clear face, 2D anime, Studio Ghibli style"
+    print(f"Generating {args.num_images} images for prompt: '{augmented_prompt}'")
+    if args.negative_prompt:
+        print(f"Using negative prompt: '{args.negative_prompt}'")
+        
     # Create generator for reproducibility
     generator = torch.Generator(device=device).manual_seed(args.seed)
     
@@ -171,7 +187,8 @@ def main():
         
         with torch.no_grad():
             image = pipe(
-                args.prompt,
+                augmented_prompt,
+                negative_prompt=args.negative_prompt if args.negative_prompt else None,
                 num_inference_steps=args.steps,
                 guidance_scale=args.guidance_scale,
                 generator=generator
