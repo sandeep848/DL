@@ -29,7 +29,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from safetensors.torch import save_file
 
-from transformers import CLIPTokenizer, CLIPTextModel, get_cosine_schedule_with_warmup
+# Using Cosine schedule with restarts to escape local plateaus
+from transformers import CLIPTokenizer, CLIPTextModel, get_cosine_with_hard_restarts_schedule_with_warmup
 from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler, StableDiffusionPipeline
 from peft import LoraConfig, get_peft_model
 from peft.utils import get_peft_model_state_dict
@@ -48,24 +49,24 @@ def set_seed(seed):
 def parse_args():
     parser = argparse.ArgumentParser(description="Dual-Adapter LoRA Style-Tuning on Stable Diffusion 1.5")
     
-    # Required arguments
+    # Optional arguments with project defaults
     parser.add_argument(
         "--data_dir", 
         type=str, 
-        required=True, 
-        help="Path to directory containing Ghibli style images"
+        default="style_imgs/512", 
+        help="Path to directory containing Ghibli style images (default: style_imgs/512)"
     )
     parser.add_argument(
         "--instance_token", 
         type=str, 
-        required=True, 
-        help="Unique identifier token for the style (e.g. <sks>)"
+        default="<sks>", 
+        help="Unique identifier token for the style (default: <sks>)"
     )
     parser.add_argument(
         "--output_dir", 
         type=str, 
-        required=True, 
-        help="Directory to save the trained LoRA weights"
+        default="lora_out", 
+        help="Directory to save the trained LoRA weights (default: lora_out)"
     )
     
     # Hyper-parameters
@@ -84,8 +85,8 @@ def parse_args():
     parser.add_argument(
         "--rank", 
         type=int, 
-        default=8, 
-        help="LoRA rank dimension (default: 8)"
+        default=16, 
+        help="LoRA rank dimension (default: 16)"
     )
     parser.add_argument(
         "--noise_offset", 
@@ -108,8 +109,8 @@ def parse_args():
     parser.add_argument(
         "--text_encoder_lr", 
         type=float, 
-        default=1e-5, 
-        help="Learning rate for the text encoder LoRA adapter weights (default: 1e-5)"
+        default=8e-6, 
+        help="Learning rate for the text encoder LoRA adapter weights (default: 8e-6)"
     )
     parser.add_argument(
         "--embedding_lr", 
@@ -138,8 +139,8 @@ def parse_args():
     parser.add_argument(
         "--max_steps", 
         type=int, 
-        default=800, 
-        help="Maximum training steps (default: 800)"
+        default=1000, 
+        help="Maximum training steps (default: 1000)"
     )
     parser.add_argument(
         "--gradient_accumulation_steps", 
@@ -164,7 +165,8 @@ def parse_args():
     parser.add_argument(
         "--overwrite", 
         action="store_true", 
-        help="Overwrite existing weights file in output directory"
+        default=True,
+        help="Overwrite existing weights file in output directory (default: True)"
     )
     parser.add_argument(
         "--no_augmentation", 
@@ -258,10 +260,11 @@ def main():
     # 6. Task 2: Configure PEFT LoRA for both UNet and Text Encoder
     print("Wrapping models with PEFT LoRA adapters...")
     
+    # Targeting both cross-attention and linear convolutional projections to capture style texture
     unet_lora_config = LoraConfig(
         r=args.rank,
         lora_alpha=args.rank,
-        target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+        target_modules=["to_q", "to_k", "to_v", "to_out.0", "proj_in", "proj_out"],
         init_lora_weights="gaussian"
     )
     unet = get_peft_model(unet, unet_lora_config)
@@ -292,14 +295,13 @@ def main():
     grad_hook_handle = register_embedding_grad_hook(token_id)
     
     # 8. Device positioning and dtype
-    vae.to(device)
+    vae.to(device)  # Keep VAE in float32 for high precision reconstructions
     unet.to(device)
     text_encoder.to(device)
     
     weight_dtype = torch.float32
     if device.type == "cuda":
         weight_dtype = torch.float16
-        vae.to(dtype=weight_dtype)
         
     # 9. Setup optimizer and dataset
     # We isolate the embedding parameter and set its weight_decay to 0.0 to prevent vocabulary decay.
@@ -315,10 +317,11 @@ def main():
         {"params": [embedding_param], "lr": args.embedding_lr, "weight_decay": 0.0}
     ]
     optimizer = torch.optim.AdamW(params_to_optimize, weight_decay=1e-2)
-    lr_scheduler = get_cosine_schedule_with_warmup(
+    lr_scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
         optimizer,
         num_warmup_steps=args.warmup_steps,
-        num_training_steps=args.max_steps
+        num_training_steps=args.max_steps,
+        num_cycles=3
     )
     
     dataset = GhibliDataset(
@@ -370,9 +373,11 @@ def main():
                 if "latents" in batch:
                     latents = batch["latents"].to(device, dtype=weight_dtype)
                 else:
-                    pixel_values = batch["pixel_values"].to(device, dtype=weight_dtype)
+                    # Run VAE encoder at full float32 precision for structural accuracy
+                    pixel_values = batch["pixel_values"].to(device, dtype=torch.float32)
                     scaling_factor = getattr(vae.config, "scaling_factor", 0.18215)
                     latents = vae.encode(pixel_values).latent_dist.sample() * scaling_factor
+                    latents = latents.to(dtype=weight_dtype)
                 
                 # Sample noise with optional offset noise to improve color contrast
                 noise = torch.randn_like(latents)
@@ -441,7 +446,7 @@ def main():
                     print(f"\n[Step {global_step}] Generating validation image...", flush=True)
                     
                     try:
-                        # Construct a temporary pipeline reusing active components to save VRAM
+                        # Construct a temporary pipeline reusing active components
                         validation_pipe = StableDiffusionPipeline(
                             vae=vae,
                             text_encoder=text_encoder,
@@ -452,6 +457,13 @@ def main():
                             feature_extractor=None,
                             requires_safety_checker=False
                         )
+                        validation_pipe.vae.to(dtype=torch.float32)  # High-precision validation decode
+                        
+                        # Wrap VAE decode to automatically handle float16 latents coming from the UNet
+                        original_decode = validation_pipe.vae.decode
+                        def float32_decode(latents, *args, **kwargs):
+                            return original_decode(latents.to(dtype=torch.float32), *args, **kwargs)
+                        validation_pipe.vae.decode = float32_decode
                         
                         with torch.inference_mode():
                             with torch.amp.autocast('cuda', enabled=(device.type == "cuda")):

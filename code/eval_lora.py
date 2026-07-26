@@ -31,24 +31,24 @@ from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate Dual-Adapter LoRA for Stable Diffusion 1.5")
     
-    # Required arguments
+    # Optional arguments with project defaults
     parser.add_argument(
         "--weights", 
         type=str, 
-        required=True, 
-        help="Path to the trained safetensors LoRA weights file"
+        default="lora_out/pytorch_lora_weights.safetensors", 
+        help="Path to the trained safetensors LoRA weights file (default: lora_out/pytorch_lora_weights.safetensors)"
     )
     parser.add_argument(
         "--prompt", 
         type=str, 
-        required=True, 
-        help="The style activation prompt (e.g. 'a busy market, in <sks> style')"
+        default="a busy market, in <sks> style", 
+        help="The style activation prompt (default: 'a busy market, in <sks> style')"
     )
     parser.add_argument(
         "--outdir", 
         type=str, 
-        required=True, 
-        help="Directory to save the generated images"
+        default="samples", 
+        help="Directory to save the generated images (default: samples)"
     )
     
     # Optional evaluation configuration
@@ -67,8 +67,8 @@ def parse_args():
     parser.add_argument(
         "--steps", 
         type=int, 
-        default=50, 
-        help="Number of inference steps (default: 50)"
+        default=40, 
+        help="Number of inference steps (default: 40)"
     )
     parser.add_argument(
         "--guidance_scale", 
@@ -89,10 +89,22 @@ def parse_args():
         help="Optional custom style token identifier (e.g. <sks>). Auto-detected from prompt if omitted."
     )
     parser.add_argument(
+        "--width", 
+        type=int, 
+        default=768, 
+        help="Width of the generated image (default: 768)"
+    )
+    parser.add_argument(
+        "--height", 
+        type=int, 
+        default=512, 
+        help="Height of the generated image (default: 512)"
+    )
+    parser.add_argument(
         "--negative_prompt", 
         type=str, 
-        default="split screen, multiple panels, borders, framing, collage, comic, multiple views, two images, deformed eyes, poorly drawn face, disfigured, bad anatomy, photorealistic, 3d render, CGI, bad face, extra limbs, ugly, blurry, noisy", 
-        help="Negative prompt to prevent photorealistic bleeding, split screens, and distorted facial features"
+        default="split screen, multiple panels, borders, framing, collage, comic, multiple views, two images, deformed eyes, poorly drawn face, disfigured, bad anatomy, photorealistic, 3d render, CGI, bad face, extra limbs, ugly, blurry, noisy, duplicate body, overlapping limbs", 
+        help="Negative prompt to prevent photorealistic bleeding, split screens, distorted facial features, and subject overlapping"
     )
     return parser.parse_args()
 
@@ -180,6 +192,14 @@ def main():
     
     # Setup execution accelerators
     pipe.to(device)
+    pipe.vae.to(dtype=torch.float32)  # Keep VAE in float32 for clean structural reconstructions
+    
+    # Wrap VAE decode to automatically handle float16 latents coming from the UNet
+    original_decode = pipe.vae.decode
+    def float32_decode(latents, *args, **kwargs):
+        return original_decode(latents.to(dtype=torch.float32), *args, **kwargs)
+    pipe.vae.decode = float32_decode
+    
     if device.type == "cuda":
         # Enable memory-efficient operations on GPU
         pipe.enable_attention_slicing()
@@ -201,8 +221,8 @@ def main():
             image = pipe(
                 prompt,
                 negative_prompt=args.negative_prompt if args.negative_prompt else None,
-                height=512,
-                width=512,
+                height=args.height,
+                width=args.width,
                 num_inference_steps=args.steps,
                 guidance_scale=args.guidance_scale,
                 generator=generator

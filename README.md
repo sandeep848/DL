@@ -5,8 +5,9 @@ This project implements a dual-adapter Low-Rank Adaptation (LoRA) style-tuning p
 ---
 
 ## Team Members
-* **Hesham Abdalla** (hesham.abdalla@utn.de)
-* **Jan Kobiolka** (jan.kobiolka@utn.de)
+* **Sandeep Das** 
+* **Mahalakshmi** 
+* **Dinely**
 
 ---
 
@@ -79,14 +80,7 @@ python code/train_lora.py \
 Generate Ghibli-style images using the trained adapter. The prompt is fully dynamic and can be changed to any subject:
 
 ```bash
-python code/eval_lora.py \
-  --weights lora_out/pytorch_lora_weights.safetensors \
-  --prompt "a busy market, in <sks> style" \
-  --outdir samples \
-  --num_images 3 \
-  --steps 50 \
-  --guidance_scale 7.5 \
-  --seed 123
+python code/eval_lora.py --weights lora_out/pytorch_lora_weights.safetensors  --prompt "a busy market, in <sks> style" --width 768 --height 512 --outdir samples --num_images 3 --steps 40 --guidance_scale 7.5 --seed 123
 ```
 
 ### Main CLI Arguments:

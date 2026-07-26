@@ -28,16 +28,22 @@ class GhibliDataset(Dataset):
             raise ValueError(f"No images found in data directory: {data_dir}")
             
         # Define image transforms
-        transform_list = [
-            transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(resolution),
-        ]
+        transform_list = []
         
-        # Apply standard augmentations for style generalization if enabled
         if use_augmentation:
+            # Random resized crop forces the model to learn fine textures and outlines 
+            # at multiple scales/crops, preventing small background faces from blurring.
             transform_list.extend([
+                transforms.RandomResizedCrop(resolution, scale=(0.85, 1.0), ratio=(1.0, 1.0), interpolation=transforms.InterpolationMode.BILINEAR),
                 transforms.RandomHorizontalFlip(p=0.5),
-                transforms.ColorJitter(brightness=0.05, contrast=0.05, saturation=0.05, hue=0.01),
+                # Emphasizes outlines and drawings so the model learns cleaner line-art borders
+                transforms.RandomAdjustSharpness(sharpness_factor=1.8, p=0.5),
+                transforms.ColorJitter(brightness=0.04, contrast=0.06, saturation=0.04, hue=0.005),
+            ])
+        else:
+            transform_list.extend([
+                transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.CenterCrop(resolution),
             ])
             
         transform_list.extend([
@@ -48,8 +54,6 @@ class GhibliDataset(Dataset):
         self.transform = transforms.Compose(transform_list)
         
         # Define subject-agnostic Studio Ghibli style prompt templates
-        # We avoid specific subjects like 'character portrait' or 'lush scenery'
-        # so that there is no semantic mismatch with training images.
         self.prompt_templates = [
             f"in {self.instance_token} style",
             f"a painting, in {self.instance_token} style",
@@ -97,12 +101,13 @@ class GhibliDataset(Dataset):
                     print(f"Error reading image {img_path}: {e}. Retrying first image.", flush=True)
                     image = Image.open(self.image_paths[0]).convert("RGB")
                 
-                pixel_values = self.transform(image).unsqueeze(0).to(device, dtype=weight_dtype)
+                # Keep VAE encoding in float32 to prevent rounding errors/clipping in details
+                pixel_values = self.transform(image).unsqueeze(0).to(device, dtype=torch.float32)
                 scaling_factor = getattr(vae.config, "scaling_factor", 0.18215)
                 # Encode to latent space and sample representation
                 latents = vae.encode(pixel_values).latent_dist.sample() * scaling_factor
                 # Store on CPU to conserve RAM/VRAM
-                self.cached_latents.append(latents.squeeze(0).cpu())
+                self.cached_latents.append(latents.squeeze(0).cpu().to(dtype=weight_dtype))
 
     def __getitem__(self, idx):
         # Randomly select a generic template for this sample on each call to prevent overfitting to a fixed mapping
