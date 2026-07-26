@@ -1,6 +1,6 @@
 # Project 4 Report: Ghibli Market Style-Tuning with Stable Diffusion 1.5
 **Course**: Deep Learning: Project 4  
-**Authors**: [Insert Team Member Names]  
+**Authors**: Hesham Abdalla (hesham.abdalla@utn.de), Jan Kobiolka (jan.kobiolka@utn.de)  
 **Date**: July 2026  
 
 ---
@@ -28,7 +28,7 @@ We configure the PEFT adapter layers with a rank $r=8$ and scaling factor $\alph
 
 ### 2.3 Optimization and Training Pipeline
 * **Model Base**: `runwayml/stable-diffusion-v1-5`
-* **Optimizer**: AdamW ($\beta_1=0.9, \beta_2=0.999$, weight decay $0.01$, learning rate $1\times 10^{-4}$)
+* **Optimizer**: AdamW ($\beta_1=0.9, \beta_2=0.999$, weight decay $0.01$ for LoRA parameters / $0.0$ for the custom token embedding, learning rate $1\times 10^{-4}$ for UNet LoRA / $1\times 10^{-5}$ for Text Encoder LoRA to preserve prompt alignment and controllability)
 * **Batch Size**: 1, with **Gradient Accumulation Steps = 4** (effective batch size of 4 to stabilize gradients)
 * **Training Steps**: 800 steps
 * **Mixed Precision**: Automatic Mixed Precision (AMP fp16) on GPU to reduce VRAM requirements to under 8 GB.

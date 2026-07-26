@@ -1,4 +1,5 @@
 import os
+import random
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
@@ -7,7 +8,7 @@ from torchvision import transforms
 class GhibliDataset(Dataset):
     """
     A custom Dataset for loading Ghibli style reference images and pairing them 
-    with the style token prompt for Stable Diffusion LoRA training.
+    with subject-agnostic style token prompts for Stable Diffusion LoRA training.
     """
     def __init__(self, data_dir, tokenizer, instance_token, resolution=512, use_augmentation=True):
         self.data_dir = data_dir
@@ -17,10 +18,11 @@ class GhibliDataset(Dataset):
         
         # Supported image formats
         self.image_extensions = (".png", ".jpg", ".jpeg", ".webp", ".PNG", ".JPG", ".JPEG", ".WEBP")
-        self.image_paths = [
+        self.image_paths = sorted([
             os.path.join(data_dir, f) for f in os.listdir(data_dir)
             if f.endswith(self.image_extensions)
-        ]
+        ])
+        self.image_paths = sorted(set(self.image_paths))  # Deduplicate and sort for reproducibility
         
         if len(self.image_paths) == 0:
             raise ValueError(f"No images found in data directory: {data_dir}")
@@ -45,17 +47,19 @@ class GhibliDataset(Dataset):
         
         self.transform = transforms.Compose(transform_list)
         
-        # Define diverse Studio Ghibli 2D anime prompt templates for style learning
+        # Define subject-agnostic Studio Ghibli style prompt templates
+        # We avoid specific subjects like 'character portrait' or 'lush scenery'
+        # so that there is no semantic mismatch with training images.
         self.prompt_templates = [
-            f"a Studio Ghibli 2D anime style painting, in {self.instance_token} style",
-            f"a hand-drawn 2D anime animation scene with vibrant background, in {self.instance_token} style",
-            f"a detailed Studio Ghibli artwork featuring lush scenery, in {self.instance_token} style",
-            f"a classic 2D Ghibli anime scene with rich colors, in {self.instance_token} style",
-            f"a masterwork 2D animation painting, in {self.instance_token} style",
-            f"a detailed Studio Ghibli character portrait, beautiful clear face, 2D anime, in {self.instance_token} style"
+            f"in {self.instance_token} style",
+            f"a painting, in {self.instance_token} style",
+            f"a 2D anime illustration, in {self.instance_token} style",
+            f"a hand-drawn animation scene, in {self.instance_token} style",
+            f"a beautiful artwork, in {self.instance_token} style",
+            f"a classic 2D animation frame, in {self.instance_token} style"
         ]
         
-        # Pre-tokenize all prompt templates
+        # Pre-tokenize all prompt templates to save computational time
         self.tokenized_prompts = [
             self.tokenizer(
                 p,
@@ -71,6 +75,13 @@ class GhibliDataset(Dataset):
 
     def __len__(self):
         return len(self.image_paths)
+
+    def __repr__(self):
+        return (f"GhibliDataset(data_dir='{self.data_dir}', "
+                f"num_images={len(self.image_paths)}, "
+                f"resolution={self.resolution}, "
+                f"token='{self.instance_token}', "
+                f"num_prompts={len(self.prompt_templates)})")
 
     def cache_latents_with_vae(self, vae, device, weight_dtype):
         """Pre-encode all images in the dataset to latents using VAE and cache them in CPU RAM."""
@@ -94,7 +105,10 @@ class GhibliDataset(Dataset):
                 self.cached_latents.append(latents.squeeze(0).cpu())
 
     def __getitem__(self, idx):
-        input_ids = self.tokenized_prompts[idx % len(self.tokenized_prompts)]
+        # Randomly select a generic template for this sample on each call to prevent overfitting to a fixed mapping
+        prompt_idx = random.randint(0, len(self.tokenized_prompts) - 1)
+        input_ids = self.tokenized_prompts[prompt_idx]
+        
         if self.cached_latents is not None:
             return {
                 "latents": self.cached_latents[idx],

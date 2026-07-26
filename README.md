@@ -1,14 +1,12 @@
 # Ghibli Market: Dual-Adapter LoRA Style-Tuning with Stable Diffusion 1.5
 
-This project implements a dual-adapter Low-Rank Adaptation (LoRA) style-tuning pipeline to teach Stable Diffusion 1.5 a specific visual style (Studio Ghibli aesthetic) from a small dataset of reference images. Both the **UNet** and **Text Encoder** are adapted.
+This project implements a dual-adapter Low-Rank Adaptation (LoRA) style-tuning pipeline to teach Stable Diffusion 1.5 a specific visual style (Studio Ghibli aesthetic) from a small dataset of reference images. Both the **UNet** and **Text Encoder** are adapted, and a custom style token `<sks>` is trained using a gradient-masked optimization path.
 
 ---
 
 ## Team Members
-* **[Team Member 1]** - Deep Learning / CV Engineer
-* **[Team Member 2]** - Deep Learning / CV Engineer
-* **[Team Member 3]** - Deep Learning / CV Engineer
-* *(Edit names in this file before final submission)*
+* **Hesham Abdalla** (hesham.abdalla@utn.de)
+* **Jan Kobiolka** (jan.kobiolka@utn.de)
 
 ---
 
@@ -44,9 +42,9 @@ pip install -r requirements.txt
 ---
 
 ## 2. Project Directory Layout
-* `code/dataset.py`: Implements custom dataset loading, resizing, center-cropping, and style token tokenization.
-* `code/train_lora.py`: Hand-crafted PyTorch training script with PEFT LoRA wrapping, custom token embedding updates, gradient isolation, gradient accumulation, and periodic visual validation.
-* `code/eval_lora.py`: Load Stable Diffusion 1.5, add style token, apply the LoRA weights, and generate high-fidelity sample images.
+* `code/dataset.py`: Implements custom dataset loading, resizing, center-cropping, data augmentations (flips/jitter), subject-agnostic prompt templates, and **random template selection** to prevent text-image concept mismatch.
+* `code/train_lora.py`: PyTorch training script with PEFT LoRA wrapping on UNet and Text Encoder, style token initialization from the `"style"` anchor word, and an **automatic PyTorch backward tensor hook** to isolate gradients to `<sks>`.
+* `code/eval_lora.py`: Load Stable Diffusion 1.5, add style token, load the custom embedding vector, apply the LoRA weights, and generate images matching the **exact prompt** passed via arguments.
 * `requirements.txt`: Project package dependencies list.
 
 ---
@@ -63,10 +61,6 @@ python code/train_lora.py \
   --rank 8 \
   --max_steps 800 \
   --learning_rate 1e-4 \
-  --batch_size 1 \
-  
-  --gradient_accumulation_steps 4 \
-  --validation_steps 200 \
   --overwrite
 ```
 
@@ -82,7 +76,7 @@ python code/train_lora.py \
 
 ## 4. Running Evaluation
 
-Generate Ghibli-style images using the trained adapter:
+Generate Ghibli-style images using the trained adapter. The prompt is fully dynamic and can be changed to any subject:
 
 ```bash
 python code/eval_lora.py \
@@ -97,33 +91,21 @@ python code/eval_lora.py \
 
 ### Main CLI Arguments:
 * `--weights`: Path to the trained safetensors file containing LoRA weights + token embeddings.
-* `--prompt`: Full text prompt including your style token (e.g. `a busy market, in <sks> style`).
+* `--prompt`: Full text prompt including the trigger token (e.g. `a busy market, in <sks> style`).
 * `--outdir`: Directory where the final output images are written.
 * `--num_images`: Number of images to generate (default: 3).
 
 ---
 
-## 5. Expected Resources & Runtime
+## 5. Key Architecture Enhancements
 
-The training loop supports Automatic Mixed Precision (AMP fp16) on GPU to minimize VRAM usage and maximize speed. Below are estimated system requirements and execution times.
+### 1. Concept Alignment & Subject-Agnostic Dataset Prompts
+In standard style-tuning, training images are often paired with random template captions. In alphabetically sorted datasets, this causes mismatched pairings where landscape images are trained on texts like `"character portrait"`—harming the model's vocabulary. 
+To resolve this:
+* We cycle through **subject-agnostic style templates** (e.g., `"a painting, in <sks> style"`, `"a 2D anime illustration, in <sks> style"`).
+* The dataset loader **randomly selects** a template for each image on every epoch, ensuring a clean style representation without forcing incorrect subject associations.
 
-### Training Performance Estimates (800 Steps)
-
-| GPU Model | VRAM Required | Speed (sec / step) | Total Training Runtime |
-| :--- | :---: | :---: | :---: |
-| **NVIDIA A100 (40GB/80GB)** | ~7.2 GB | ~0.15s / step | **~2 minutes** |
-| **NVIDIA RTX 3090 / 4090** | ~7.5 GB | ~0.25s / step | **~3.5 minutes** |
-| **NVIDIA T4 (Google Colab)** | ~6.8 GB | ~0.95s / step | **~13 minutes** |
-| **CPU Only (Dry-Run)** | ~8.0 GB (System RAM) | ~15.0s / step | ~3.3 hours (Not recommended for training) |
-
-### Inference Performance (eval_lora.py)
-* **GPU**: Generates 3 images (50 steps each) in **~5-10 seconds** total.
-* **CPU**: Generates 3 images (50 steps each) in **~8-12 minutes** total.
-
----
-
-## 6. How the Custom Token is Saved and Reloaded
-To satisfy the requirements of reproducibility and ensure that the custom style token `<sks>` is retained:
-1. During **training** (`train_lora.py`), we add `<sks>` to the tokenizer, resize the CLIP text encoder embeddings, and initialize `<sks>` with the weights of the anchor word `"style"`.
-2. When training finishes, we save the trained embedding row corresponding to `<sks>` inside the final safetensors weights file under the key `text_encoder_embeddings`.
-3. During **evaluation** (`eval_lora.py`), the script dynamically re-injects `<sks>` into the tokenizer, resizes the text encoder embeddings, and loads the saved tensor directly into the text encoder's embedding table at the correct index before applying the LoRA attention layers. This makes the `<sks>` token self-contained and reproducible.
+### 2. PyTorch Tensor Hook for Gradient Masking
+Training a new vocabulary row normally requires freezing the rest of the embedding table manually at each step. 
+* We register a **PyTorch backward gradient hook** (`register_hook`) directly on the text encoder's expanded embedding weight tensor.
+* During the backward pass, PyTorch automatically zero-flops all gradients for standard words, leaving only the gradient of `<sks>` active before they reach the optimizer. This isolates updates cleanly without cluttering the training loop.

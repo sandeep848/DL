@@ -2,7 +2,7 @@ import os
 import sys
 import builtins
 
-# Override built-in print to force flushing and gracefully handle Windows console unicode encoding errors
+# Override built-in print to force flushing and gracefully handle console encoding issues
 def print(*args, **kwargs):
     kwargs.setdefault('flush', True)
     encoding = getattr(sys.stdout, 'encoding', 'utf-8') or 'utf-8'
@@ -14,9 +14,8 @@ def print(*args, **kwargs):
             clean_args.append(arg)
     builtins.print(*clean_args, **kwargs)
 
-# Suppress TensorFlow logging to clean up execution output and speed up imports
+# Suppress warnings and logs to clean up output
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-# Disable oneDNN custom operations warnings from TensorFlow
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 print("🎨 Ghibli Market LoRA: Starting initialization...")
@@ -30,8 +29,6 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from safetensors.torch import save_file
 
-print("Importing Stable Diffusion & PEFT libraries (this can take up to a minute on CPU)...", flush=True)
-# Import Stable Diffusion and PEFT components
 from transformers import CLIPTokenizer, CLIPTextModel, get_cosine_schedule_with_warmup
 from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler, StableDiffusionPipeline
 from peft import LoraConfig, get_peft_model
@@ -39,7 +36,6 @@ from peft.utils import get_peft_model_state_dict
 
 # Custom Dataset
 from dataset import GhibliDataset
-
 
 def set_seed(seed):
     """Set random seed for reproducibility."""
@@ -88,8 +84,8 @@ def parse_args():
     parser.add_argument(
         "--rank", 
         type=int, 
-        default=32, 
-        help="LoRA rank dimension (default: 32)"
+        default=8, 
+        help="LoRA rank dimension (default: 8)"
     )
     parser.add_argument(
         "--noise_offset", 
@@ -100,8 +96,8 @@ def parse_args():
     parser.add_argument(
         "--initializer_token", 
         type=str, 
-        default="anime", 
-        help="Vocabulary token word used to initialize the style token embedding (default: 'anime')"
+        default="style", 
+        help="Vocabulary token word used to initialize the style token embedding (default: 'style')"
     )
     parser.add_argument(
         "--learning_rate", 
@@ -110,10 +106,16 @@ def parse_args():
         help="Learning rate for LoRA weights"
     )
     parser.add_argument(
+        "--text_encoder_lr", 
+        type=float, 
+        default=1e-5, 
+        help="Learning rate for the text encoder LoRA adapter weights (default: 1e-5)"
+    )
+    parser.add_argument(
         "--embedding_lr", 
         type=float, 
-        default=5e-4, 
-        help="Learning rate for the custom style token embedding (default: 5e-4)"
+        default=1e-4, 
+        help="Learning rate for the custom style token embedding (default: 1e-4)"
     )
     parser.add_argument(
         "--snr_gamma", 
@@ -136,8 +138,8 @@ def parse_args():
     parser.add_argument(
         "--max_steps", 
         type=int, 
-        default=1500, 
-        help="Maximum training steps (default: 1500)"
+        default=800, 
+        help="Maximum training steps (default: 800)"
     )
     parser.add_argument(
         "--gradient_accumulation_steps", 
@@ -155,7 +157,7 @@ def parse_args():
         "--validation_steps", 
         type=int, 
         default=None, 
-        help="Generate validation images every X steps (defaults to 0 on CPU, 200 on GPU)"
+        help="Generate validation images every X steps (defaults to 200 on GPU)"
     )
     
     # Toggles
@@ -231,12 +233,11 @@ def main():
     print(f"Added token: {args.instance_token} to tokenizer. Number of added tokens: {num_added_tokens}")
     text_encoder.resize_token_embeddings(len(tokenizer))
     
-    # Initialize the new token embedding with the initializer token representation (default: 'anime')
+    # Initialize the new token embedding with the initializer token representation (default: 'style')
     token_id = tokenizer.convert_tokens_to_ids(args.instance_token)
     anchor_token = args.initializer_token
     style_token_ids = tokenizer.encode(anchor_token, add_special_tokens=False)
     if len(style_token_ids) == 0 and anchor_token != "style":
-        # Fallback to 'style' if anchor_token is not found
         anchor_token = "style"
         style_token_ids = tokenizer.encode(anchor_token, add_special_tokens=False)
         
@@ -278,24 +279,30 @@ def main():
     # Enable gradient tracking on the text encoder embeddings matrix so the new token is trained
     text_encoder.get_input_embeddings().weight.requires_grad_(True)
     
-    # 7. Device positioning and dtype
+    # 7. Register PyTorch gradient hook to isolate updates to ONLY the custom trigger token.
+    # This prevents vocabulary drift automatically during backpropagation.
+    embedding_param = text_encoder.get_input_embeddings().weight
+    def register_embedding_grad_hook(target_token_id):
+        def hook(grad):
+            mask = torch.zeros(grad.shape[0], 1, device=grad.device)
+            mask[target_token_id] = 1.0
+            return grad * mask
+        return embedding_param.register_hook(hook)
+    
+    grad_hook_handle = register_embedding_grad_hook(token_id)
+    
+    # 8. Device positioning and dtype
     vae.to(device)
     unet.to(device)
     text_encoder.to(device)
     
-    # Fallback to fp32 on CPU, AMP fp16 on GPU for VAE / latents
     weight_dtype = torch.float32
     if device.type == "cuda":
         weight_dtype = torch.float16
         vae.to(dtype=weight_dtype)
-        # Note: unet and text_encoder trainable weights stay in float32 for GradScaler / AMP compatibility
         
-    # 8. Setup optimizer and dataset
-    # We optimize the LoRA weights of UNet and Text Encoder, AND the custom embedding token
-    # We optimize the LoRA weights of UNet and Text Encoder, AND the custom embedding token.
-    # We must isolate the embedding parameter and set its weight_decay to 0.0 to prevent
-    # decaying the base vocabulary of the text encoder.
-    embedding_param = text_encoder.get_input_embeddings().weight
+    # 9. Setup optimizer and dataset
+    # We isolate the embedding parameter and set its weight_decay to 0.0 to prevent vocabulary decay.
     text_encoder_params = [
         p for p in filter(lambda p: p.requires_grad, text_encoder.parameters()) 
         if p is not embedding_param
@@ -304,7 +311,7 @@ def main():
     
     params_to_optimize = [
         {"params": unet_params, "lr": args.learning_rate},
-        {"params": text_encoder_params, "lr": args.learning_rate},
+        {"params": text_encoder_params, "lr": args.text_encoder_lr},
         {"params": [embedding_param], "lr": args.embedding_lr, "weight_decay": 0.0}
     ]
     optimizer = torch.optim.AdamW(params_to_optimize, weight_decay=1e-2)
@@ -333,15 +340,16 @@ def main():
         num_workers=0
     )
     
-    # 9. Training Loop Setup
+    # 10. Training Loop Setup
     global_step = 0
+    accumulation_step = 0
     epochs = (args.max_steps * args.gradient_accumulation_steps // len(train_dataloader)) + 1
     
     print(f"Beginning training loop. Total epochs: {epochs}, Max steps: {args.max_steps}")
     progress_bar = tqdm(total=args.max_steps, desc="Training")
     
     # Setup mixed-precision Scaler if on GPU
-    scaler = torch.amp.GradScaler('cuda', enabled=(device.type == "cuda"))
+    scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
     
     unet.train()
     text_encoder.train()
@@ -360,15 +368,13 @@ def main():
             # Forward pass inside context manager for mixed precision
             with torch.amp.autocast('cuda', enabled=(device.type == "cuda")):
                 if "latents" in batch:
-                    # Use pre-cached VAE latents (CPU/GPU-agnostic)
                     latents = batch["latents"].to(device, dtype=weight_dtype)
                 else:
-                    # Run VAE encoder on-the-fly (e.g. if data augmentation is on)
                     pixel_values = batch["pixel_values"].to(device, dtype=weight_dtype)
                     scaling_factor = getattr(vae.config, "scaling_factor", 0.18215)
                     latents = vae.encode(pixel_values).latent_dist.sample() * scaling_factor
                 
-                # Sample noise with optional offset noise to improve dynamic range and color contrast
+                # Sample noise with optional offset noise to improve color contrast
                 noise = torch.randn_like(latents)
                 if args.noise_offset > 0:
                     noise += args.noise_offset * torch.randn(
@@ -406,19 +412,13 @@ def main():
                     
                 loss = loss / args.gradient_accumulation_steps
                 
-            # Backward pass
+            # Backward pass (hook handles masking automatically)
             scaler.scale(loss).backward()
             
-            # Zero out gradients for all token embeddings except the custom style token (<sks>)
-            # This isolates updates to the style token representation, protecting vocabulary base weights
-            if text_encoder.get_input_embeddings().weight.grad is not None:
-                grad = text_encoder.get_input_embeddings().weight.grad
-                mask = torch.zeros(grad.shape[0], 1, device=grad.device)
-                mask[token_id] = 1.0
-                grad.data.mul_(mask)
+            accumulation_step += 1
                 
             # Step optimizer after gradient accumulation steps
-            if (step + 1) % args.gradient_accumulation_steps == 0:
+            if accumulation_step % args.gradient_accumulation_steps == 0:
                 # Gradient clipping
                 scaler.unscale_(optimizer)
                 all_trainable_params = [p for group in params_to_optimize for p in group["params"]]
@@ -433,7 +433,7 @@ def main():
                 progress_bar.update(1)
                 progress_bar.set_postfix({"loss": loss.item() * args.gradient_accumulation_steps})
                 
-                # 10. Intermediate Validation Generation
+                # 11. Intermediate Validation Generation
                 if args.validation_steps > 0 and global_step % args.validation_steps == 0:
                     unet.eval()
                     text_encoder.eval()
@@ -441,7 +441,7 @@ def main():
                     print(f"\n[Step {global_step}] Generating validation image...", flush=True)
                     
                     try:
-                        # Construct a temporary pipeline reusing active components to save system RAM and VRAM
+                        # Construct a temporary pipeline reusing active components to save VRAM
                         validation_pipe = StableDiffusionPipeline(
                             vae=vae,
                             text_encoder=text_encoder,
@@ -453,13 +453,13 @@ def main():
                             requires_safety_checker=False
                         )
                         
-                        # Generate image
-                        with torch.no_grad():
-                            image = validation_pipe(
-                                validation_prompt,
-                                num_inference_steps=30,
-                                guidance_scale=7.5
-                            ).images[0]
+                        with torch.inference_mode():
+                            with torch.amp.autocast('cuda', enabled=(device.type == "cuda")):
+                                image = validation_pipe(
+                                    validation_prompt,
+                                    num_inference_steps=30,
+                                    guidance_scale=7.5
+                                ).images[0]
                             
                         # Save validation image
                         val_dir = os.path.join(args.output_dir, "validation")
@@ -475,7 +475,10 @@ def main():
                     
     progress_bar.close()
     
-    # 11. Extract and Clean PEFT LoRA state dicts
+    # Remove gradient hook handle before saving to avoid cleanup issues
+    grad_hook_handle.remove()
+    
+    # 12. Extract and Clean PEFT LoRA state dicts
     print("Preparing adapters for saving...")
     unet_state_dict = get_peft_model_state_dict(unet, adapter_name="default")
     text_encoder_state_dict = get_peft_model_state_dict(text_encoder, adapter_name="default")
@@ -487,11 +490,10 @@ def main():
     save_dict = {**clean_unet_dict, **clean_text_encoder_dict}
     
     # Save the trained embedding of the style token representation
-    # We store only the specific row matching the added token to keep weights small
     trained_embedding = text_encoder.get_input_embeddings().weight.data[token_id].cpu()
     save_dict["text_encoder_embeddings"] = trained_embedding
     
-    # 12. Save File
+    # Save file
     print(f"Saving final adapter weights to {weights_path}...")
     save_file(save_dict, weights_path)
     print("Training finished successfully! All deliverables produced.")

@@ -91,10 +91,9 @@ def parse_args():
     parser.add_argument(
         "--negative_prompt", 
         type=str, 
-        default="deformed eyes, poorly drawn face, disfigured, bad anatomy, photorealistic, 3d render, realistic photo, CGI, photograph, real life, 3d digital art, bad face, extra limbs, low resolution, ugly, blurry, noisy", 
-        help="Negative prompt to prevent photorealistic bleeding and distorted facial features"
+        default="split screen, multiple panels, borders, framing, collage, comic, multiple views, two images, deformed eyes, poorly drawn face, disfigured, bad anatomy, photorealistic, 3d render, CGI, bad face, extra limbs, ugly, blurry, noisy", 
+        help="Negative prompt to prevent photorealistic bleeding, split screens, and distorted facial features"
     )
-    
     return parser.parse_args()
 
 def main():
@@ -106,6 +105,15 @@ def main():
     # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running evaluation on device: {device}")
+    
+    # Set seed for reproducibility
+    import random
+    import numpy as np
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     
     # Precision setting
     weight_dtype = torch.float32
@@ -144,6 +152,9 @@ def main():
     print(f"Loading custom weights from: {args.weights}")
     state_dict = load_file(args.weights)
     
+    # Extract custom token embedding before loading LoRA weights
+    trained_embedding = state_dict.pop("text_encoder_embeddings", None)
+    
     # Process custom token embedding if present
     if instance_token is not None:
         # Add token to tokenizer
@@ -151,19 +162,20 @@ def main():
         pipe.text_encoder.resize_token_embeddings(len(pipe.tokenizer))
         token_id = pipe.tokenizer.convert_tokens_to_ids(instance_token)
         
-    # Load remaining LoRA weights (UNet and text encoder)
-    # Always pop text_encoder_embeddings if it exists so load_lora_weights doesn't crash on keys without 'lora' substring
-    if "text_encoder_embeddings" in state_dict:
-        trained_embedding = state_dict.pop("text_encoder_embeddings")
-        if instance_token is not None:
+        if trained_embedding is not None:
             print(f"Loading trained embedding of shape {trained_embedding.shape} for token {instance_token} (ID {token_id})")
             with torch.no_grad():
                 pipe.text_encoder.get_input_embeddings().weight.data[token_id] = trained_embedding.to(
                     device=pipe.text_encoder.get_input_embeddings().weight.device, dtype=weight_dtype
                 )
         else:
+            print(f"Warning: No saved embedding found for token {instance_token}. Using random initialization.")
+    else:
+        if trained_embedding is not None:
             print("Warning: Custom token embedding found in weights but no token provided in prompt to attach it to.")
-            
+    
+    # Load LoRA adapter weights into the pipeline
+    # We pass the cleaned state_dict (without text_encoder_embeddings) directly
     pipe.load_lora_weights(state_dict)
     
     # Setup execution accelerators
@@ -174,8 +186,8 @@ def main():
         pipe.enable_vae_slicing()
         
     # 4. Generate Images
-    augmented_prompt = args.prompt + ", masterpiece, high quality, highly detailed, beautiful clear face, 2D anime, Studio Ghibli style"
-    print(f"Generating {args.num_images} images for prompt: '{augmented_prompt}'")
+    prompt = args.prompt
+    print(f"Generating {args.num_images} images for prompt: '{prompt}'")
     if args.negative_prompt:
         print(f"Using negative prompt: '{args.negative_prompt}'")
         
@@ -185,10 +197,12 @@ def main():
     for idx in range(args.num_images):
         print(f"Rendering image {idx + 1} of {args.num_images}...")
         
-        with torch.no_grad():
+        with torch.inference_mode():
             image = pipe(
-                augmented_prompt,
+                prompt,
                 negative_prompt=args.negative_prompt if args.negative_prompt else None,
+                height=512,
+                width=512,
                 num_inference_steps=args.steps,
                 guidance_scale=args.guidance_scale,
                 generator=generator
